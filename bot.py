@@ -1,5 +1,6 @@
 import os
 import random
+import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -104,10 +105,14 @@ async def handle_application_text(update: Update, context: ContextTypes.DEFAULT_
         "text": update.message.text,
     }
 
+    # Экранируем текст, чтобы символы вроде < или > не сломали HTML-разметку бота
+    safe_user_text = html.escape(update.message.text)
+
     # Сообщение администраторам
     admin_text = (
         f"Пользователь @{user.username or '—'} (ID: {user_id}) подал заявку.\n"
         f"Его форма ниже:\n\n"
+        f"<blockquote>{safe_user_text}</blockquote>\n\n"
         f"<b>S-ID: {s_id}</b> (нажмите, чтобы скопировать: <code>{s_id}</code>)\n\n"
         f"<i>Если кнопки не работают, пропишите вручную:\n"
         f"/Yes {s_id}  — для одобрения\n"
