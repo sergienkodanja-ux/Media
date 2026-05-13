@@ -11,19 +11,24 @@ from telegram.ext import (
 )
 
 # --------------------- НАСТРОЙКИ ---------------------
-BOT_TOKEN = os.environ.get("8674676600:AAHndeOE2Ia2ZNUvr-uSboIbfH7yHpySEmQ", "8674676600:AAHndeOE2Ia2ZNUvr-uSboIbfH7yHpySEmQ")
+BOT_TOKEN = os.environ.get("8644631276:AAFvy1bOWryarOtLRqz3eJFzpxxZwa1-zbE", "8644631276:AAFvy1bOWryarOtLRqz3eJFzpxxZwa1-zbE")
 ADMIN_IDS = [8350956257, 8108645611, 7297564960]  # Замените на реальные ID
 
 PRIVACY_URL = "https://example.com/privacy"
-CHANNEL_URL = "https://t.me/lexoravisuals"
-DEV_BLOG_URL = "https://t.me/lexora_dev"
+CHANNEL_URL = "https://t.me/lexora_visuals"
+DEV_BLOG_URL = "https://dev.lexora.com"
 
-# --------------------- ХРАНИЛИЩА ---------------------
+# --------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---------------------
 awaiting_application = set()
-applications = {}  # s_id -> {user_id, username}
+applications = {}          # s_id -> {user_id, username}
+app_status = 'open'        # 'open', 'weekend', 'closed'
+all_users = set()          # все известные ID пользователей (для рассылки)
 
 # --------------------- ФУНКЦИИ ---------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    all_users.add(user_id)   # запоминаем пользователя
+
     keyboard = [
         [InlineKeyboardButton("СТАТЬ ПАРТНЁРОМ", callback_data="become_partner")],
         [
@@ -40,8 +45,56 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
     )
 
-async def start_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --------------------- УПРАВЛЕНИЕ ЗАЯВКАМИ ---------------------
+async def weekend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Администратор включает режим 'выходной'. Теперь команда /dayoff."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Команда доступна только администраторам.")
+        return
+    global app_status
+    app_status = 'weekend'
+    await update.message.reply_text("🔴 Режим «выходной» активирован. Заявки не принимаются до воскресенья.")
+
+async def unm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Администратор закрывает приём заявок."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Команда доступна только администраторам.")
+        return
+    global app_status
+    app_status = 'closed'
+    await update.message.reply_text("🔴 Приём заявок закрыт.")
+
+async def onm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Администратор открывает приём заявок и уведомляет всех пользователей."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Команда доступна только администраторам.")
+        return
+    global app_status
+    app_status = 'open'
+
+    # Рассылаем уведомление всем известным пользователям
+    text = "заявки на сотрудничество вновь открыты подавай заявку скорее!\n\n/start"
+    for uid in all_users:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+        except Exception as e:
+            print(f"Не удалось уведомить {uid}: {e}")
+
+    await update.message.reply_text("🟢 Приём заявок открыт. Уведомление отправлено всем пользователям.")
+
+# --------------------- ПРОВЕРКА СТАТУСА ---------------------
+async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /media (аналог кнопки СТАТЬ ПАРТНЁРОМ)."""
     user_id = update.effective_user.id
+    all_users.add(user_id)
+
+    if app_status == 'weekend':
+        await update.message.reply_text("на данный момент у команды проекта выходной до воскресенья извините.")
+        return
+    elif app_status == 'closed':
+        await update.message.reply_text("заявки на сотрудничество закрыты попробуйте позже!")
+        return
+
     await update.message.reply_text("Заполни форму ниже!")
     await update.message.reply_text(
         "1. Ваш username в Telegram: @nezexy\n"
@@ -54,8 +107,19 @@ async def start_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
     awaiting_application.add(user_id)
 
 async def become_partner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'СТАТЬ ПАРТНЁРОМ'."""
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
+    all_users.add(user_id)
+
+    if app_status == 'weekend':
+        await query.message.reply_text("на данный момент у команды проекта выходной до воскресенья извините.")
+        return
+    elif app_status == 'closed':
+        await query.message.reply_text("заявки на сотрудничество закрыты попробуйте позже!")
+        return
+
     await query.message.reply_text("Заполни форму ниже!")
     await query.message.reply_text(
         "1. Ваш username в Telegram: @nezexy\n"
@@ -65,12 +129,10 @@ async def become_partner_callback(update: Update, context: ContextTypes.DEFAULT_
         "5. Почему именно мы?: нравитесь\n"
         "6. Вы согласны с политикой конфиденциальности?: да"
     )
-    awaiting_application.add(query.from_user.id)
-
-async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_application(update, context)
+    awaiting_application.add(user_id)
 
 async def handle_application_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение текста заявки."""
     user = update.message.from_user
     user_id = user.id
 
@@ -89,7 +151,6 @@ async def handle_application_text(update: Update, context: ContextTypes.DEFAULT_
         "username": user.username,
     }
 
-    # Вот здесь главное исправление: добавляем текст заявки
     admin_text = (
         f"Пользователь @{user.username or '—'} (ID: {user_id}) подал заявку.\n"
         f"Его форма ниже:\n\n"
@@ -98,7 +159,7 @@ async def handle_application_text(update: Update, context: ContextTypes.DEFAULT_
         f"/Yes {s_id}  — для одобрения\n"
         f"/No {s_id}   — для отклонения</i>\n\n"
         f"<b>Текст заявки:</b>\n"
-        f"{update.message.text}"  # <-- сама форма пользователя
+        f"{update.message.text}"
     )
 
     keyboard = [
@@ -249,24 +310,33 @@ async def tex_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Ошибка пересылки медиа админу {admin_id}: {e}")
     await update.message.reply_text("✅ Ваше медиасообщение отправлено администраторам.")
 
+# --------------------- ЗАПУСК ---------------------
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Базовые команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("media", media_command))
+
+    # Административные команды (заменил /выходной на /dayoff)
+    application.add_handler(CommandHandler("dayoff", weekend_command))
+    application.add_handler(CommandHandler("unm", unm_command))
+    application.add_handler(CommandHandler("onm", onm_command))
+
+    # Callback'и
     application.add_handler(CallbackQueryHandler(become_partner_callback, pattern="^become_partner$"))
     application.add_handler(CallbackQueryHandler(handle_admin_decision, pattern="^(appr_|rej_)"))
 
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_application_text
-    ))
+    # Текстовые заявки
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_application_text))
 
+    # Ручное одобрение/отклонение
     application.add_handler(CommandHandler("yes", yes_command))
     application.add_handler(CommandHandler("no", no_command))
+
+    # Техподдержка
     application.add_handler(CommandHandler("tex", tex_command_text))
-    application.add_handler(MessageHandler(
-        filters.CAPTION & filters.Regex(r'^/tex'), tex_media_handler
-    ))
+    application.add_handler(MessageHandler(filters.CAPTION & filters.Regex(r'^/tex'), tex_media_handler))
 
     print("Бот запущен...")
     application.run_polling()
