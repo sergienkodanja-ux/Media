@@ -1,150 +1,280 @@
-import telebot
-from telebot import types
-import sqlite3
-import random
-from datetime import datetime, timedelta
+import asyncio
+import logging
 
-# --- НАСТРОЙКИ ---
-BOT_TOKEN = '8938905705:AAHGsCOozAcp2JHwb-3WS6-ptv_EGNyZyEU'
-TGK_LINK = 'https://t.me/user_sechtgk'
-DAILY_LIMIT = 3
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# ==================== НАСТРОЙКИ ====================
+BOT_TOKEN = "8953808291:AAG2z4vW76sHws4mKR7LvOSqO294vDXw5iI"
+ADMIN_IDS = [7297564960, 8996642772]   # ID админов (узнать можно у @userinfobot)
+CHANNEL_URL = "https://t.me/LexoraVisuals"
+# ===================================================
 
-# --- БАЗА ДАННЫХ ---
-def init_db():
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            attempts_left INTEGER DEFAULT 3,
-            last_reset TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+logging.basicConfig(level=logging.INFO)
 
-def get_user(user_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT attempts_left, last_reset FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row
+router = Router()
 
-def update_user(user_id, attempts_left, last_reset=None):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    if last_reset:
-        cursor.execute('UPDATE users SET attempts_left = ?, last_reset = ? WHERE user_id = ?',
-                       (attempts_left, last_reset, user_id))
-    else:
-        cursor.execute('UPDATE users SET attempts_left = ? WHERE user_id = ?',
-                       (attempts_left, user_id))
-    conn.commit()
-    conn.close()
+# Простая память (при перезапуске сбрасывается — при желании замените на SQLite)
+users_started: set[int] = set()         # кто нажал /start
+applicants: list[str] = []              # юзернеймы тех, кто заполнил анкету
+pending_forms: dict[int, dict] = {}     # user_id -> данные анкеты
 
-def create_user(user_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    now = datetime.now().isoformat()
-    cursor.execute('INSERT OR IGNORE INTO users (user_id, attempts_left, last_reset) VALUES (?, ?, ?)',
-                   (user_id, DAILY_LIMIT, now))
-    conn.commit()
-    conn.close()
 
-def check_and_reset_attempts(user_id):
-    """Сбрасывает попытки раз в 24 часа."""
-    row = get_user(user_id)
-    if not row:
-        create_user(user_id)
-        return DAILY_LIMIT
+# ==================== СОСТОЯНИЯ ====================
+class Form(StatesGroup):
+    name = State()
+    channel = State()
+    username = State()
+    views = State()
+    timezone = State()
 
-    attempts_left, last_reset_str = row
-    last_reset = datetime.fromisoformat(last_reset_str)
 
-    if datetime.now() - last_reset >= timedelta(days=1):
-        update_user(user_id, DAILY_LIMIT, datetime.now().isoformat())
-        return DAILY_LIMIT
-    return attempts_left
+class Ads(StatesGroup):
+    waiting_text = State()
+    confirm = State()
 
-# --- ГЕНЕРАЦИЯ ЮЗЕРНЕЙМОВ ---
-def generate_username():
-    consonants = 'bcdfghjklmnpqrstvwxyz'
-    vowels = 'aeiou'
-    patterns = [
-        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels) + random.choice(consonants),
-        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels) + random.choice(vowels),
-        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels),
-        lambda: random.choice(consonants) + random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels),
-        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(consonants) + random.choice(vowels),
-    ]
-    return random.choice(patterns)()
 
-# --- КЛАВИАТУРЫ ---
-def main_keyboard():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    btn_tgk = types.InlineKeyboardButton('📢 наш тгк', url=TGK_LINK)
-    btn_search = types.InlineKeyboardButton('🔍 искать username', callback_data='search')
-    markup.add(btn_tgk, btn_search)
-    return markup
-
-def result_keyboard():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    btn_again = types.InlineKeyboardButton('🔄 искать ещё', callback_data='search')
-    markup.add(btn_again)
-    return markup
-
-# --- ХЭНДЛЕРЫ ---
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.from_user.id
-    create_user(user_id)
-    check_and_reset_attempts(user_id)
-
-    text = (
-        "Привет я бот ищейка Юзов составлю красивый юзернейм "
-        "у тебя в день лимит 3 попытки поиска."
+# ==================== /START ====================
+@router.message(CommandStart())
+async def start_cmd(message: Message):
+    users_started.add(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="стать MEDIA 🏆", callback_data="become_media")],
+        [InlineKeyboardButton(text="наш телеграм канал🍀", url=CHANNEL_URL)],
+    ])
+    await message.answer(
+        "✈️ привет я бот пиар-менеджер который помогает искать MEDIA партнёров "
+        "если хочешь стать частью нас выбери что-то из пунктов ниже!",
+        reply_markup=kb,
     )
-    bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
 
-@bot.callback_query_handler(func=lambda call: call.data == 'search')
-def handle_search(call):
-    user_id = call.from_user.id
-    attempts_left = check_and_reset_attempts(user_id)
 
-    if attempts_left <= 0:
-        row = get_user(user_id)
-        last_reset = datetime.fromisoformat(row[1])
-        next_reset = last_reset + timedelta(days=1)
-        seconds_left = (next_reset - datetime.now()).total_seconds()
-        hours_left = max(1, int(seconds_left // 3600) + (1 if seconds_left % 3600 else 0))
+# ==================== СТАТЬ MEDIA ====================
+@router.callback_query(F.data == "become_media")
+async def become_media(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="погнали!", callback_data="go")],
+    ])
+    await cb.message.edit_text(
+        "стой стой стой! давай ты прочитаешь наши условия",
+        reply_markup=kb,
+    )
+    await cb.answer()
 
-        bot.answer_callback_query(call.id)
-        bot.send_message(
-            call.message.chat.id,
-            f"🍕 попытки кончились попробуй через {hours_left} ч."
-        )
+
+@router.callback_query(F.data == "go")
+async def go(cb: CallbackQuery):
+    text = (
+        "наши условия!\n"
+        "Выплаты 💸\n"
+        "1000 просмотров - 35 руб на баланс на сайте.\n"
+        "2000 просмотров - 70 руб на баланс на сайте.\n"
+        "5000 просмотров - 375 руб на баланс на сайте.\n"
+        "12000 просмотров - 750 руб на баланс на сайте.\n"
+        "Условия работы ❄️\n"
+        "1.у вас обязательно должно быть 3 ролика в неделю не меньше\n"
+        "2.если вы решили слить важную информацию которую запрещено сливать "
+        "вы попадаете в ЧСП проекта Lexora Visuals.\n"
+        "3.у вас в чате будет ранг Тик Токер или Ютубер если вы будете привышать "
+        "свои уполномочия то получите выговор\n"
+        "(коротко говоря если вы что-то сделаете не так вам напишет наш менеджер)."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="отлично, заполнить анкету!", callback_data="fill_form")],
+    ])
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+# ==================== АНКЕТА ====================
+@router.callback_query(F.data == "fill_form")
+async def fill_form(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.name)
+    await cb.message.answer("1.ваше имя :")
+    await cb.answer()
+
+
+@router.message(Form.name)
+async def form_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(Form.channel)
+    await message.answer("2.ссылка на канал :")
+
+
+@router.message(Form.channel)
+async def form_channel(message: Message, state: FSMContext):
+    await state.update_data(channel=message.text)
+    await state.set_state(Form.username)
+    await message.answer("3.ваш юзернейм в Telegram (для связи):")
+
+
+@router.message(Form.username)
+async def form_username(message: Message, state: FSMContext):
+    await state.update_data(username=message.text)
+    await state.set_state(Form.views)
+    await message.answer("4.число просмотров в день (стабильно 350):")
+
+
+@router.message(Form.views)
+async def form_views(message: Message, state: FSMContext):
+    await state.update_data(views=message.text)
+    await state.set_state(Form.timezone)
+    await message.answer("5.ваш часовой пояс:")
+
+
+@router.message(Form.timezone)
+async def form_timezone(message: Message, state: FSMContext, bot: Bot):
+    await state.update_data(timezone=message.text)
+    data = await state.get_data()
+
+    user_id = message.from_user.id
+    tg_username = message.from_user.username or message.from_user.full_name
+
+    pending_forms[user_id] = data
+    applicants.append(f"@{tg_username}")
+
+    await message.answer(
+        "(если заявка будет одобрена то вам напишет менеджер).\n\n"
+        "✅ Анкета отправлена на проверку!"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="проверить", callback_data=f"check:{user_id}")],
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"пользователь @{tg_username} отправил анкету проверить ее?",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logging.warning(f"Не смог отправить админу {admin_id}: {e}")
+
+    await state.clear()
+
+
+# ==================== ПРОВЕРКА АНКЕТЫ ====================
+@router.callback_query(F.data.startswith("check:"))
+async def check_form(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("нет доступа", show_alert=True)
         return
 
-    # Генерируем ОДИН юзернейм за нажатие
-    username = generate_username()
-    new_attempts = attempts_left - 1
-    update_user(user_id, new_attempts)
+    user_id = int(cb.data.split(":")[1])
+    data = pending_forms.get(user_id)
+    if not data:
+        await cb.answer("анкета не найдена", show_alert=True)
+        return
 
-    text = (
-        f"✈️ Вот твой username\n"
-        f"@{username}\n"
-        f"используй его если он тебе нравится\n\n"
-        f"у тебя осталось попыток {new_attempts}"
+    form_text = (
+        "анкета пользователя:\n"
+        f"1.имя: {data['name']}\n"
+        f"2.ссылка на канал: {data['channel']}\n"
+        f"3.юзернейм в Telegram: {data['username']}\n"
+        f"4.просмотров в день: {data['views']}\n"
+        f"5.часовой пояс: {data['timezone']}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="отклонить", callback_data=f"reject:{user_id}")],
+    ])
+    await cb.message.answer(form_text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("reject:"))
+async def reject_form(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("нет доступа", show_alert=True)
+        return
+
+    user_id = int(cb.data.split(":")[1])
+    try:
+        await bot.send_message(
+            user_id,
+            "ваша анкета отклонена извините попробуйте в следующий раз!",
+        )
+        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.answer("пользователь уведомлён")
+    except Exception:
+        await cb.answer("не смог отправить пользователю", show_alert=True)
+
+
+# ==================== КОМАНДА /ads ====================
+@router.message(Command("ads"))
+async def ads_cmd(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(Ads.waiting_text)
+    await message.answer(
+        "напиши объявление и оно отправится всем пользователям бота которые нажали /start"
     )
 
-    bot.send_message(call.message.chat.id, text, reply_markup=result_keyboard())
-    bot.answer_callback_query(call.id)
 
-# --- ЗАПУСК ---
-if __name__ == '__main__':
-    init_db()
-    print('Бот запущен...')
-    bot.polling(none_stop=True)
+@router.message(Ads.waiting_text)
+async def ads_get_text(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.update_data(ads_text=message.text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="да", callback_data="ads_yes")],
+        [InlineKeyboardButton(text="отменить", callback_data="ads_no")],
+    ])
+    await message.answer(
+        f"ты хочешь объявить объявление {message.text} верно?",
+        reply_markup=kb,
+    )
+    await state.set_state(Ads.confirm)
+
+
+@router.callback_query(Ads.confirm, F.data == "ads_yes")
+async def ads_yes(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    text = data.get("ads_text", "")
+    sent = 0
+    for uid in list(users_started):
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            pass
+    await cb.message.edit_text(f"✅ объявление отправлено {sent} пользователям")
+    await state.clear()
+
+
+@router.callback_query(Ads.confirm, F.data == "ads_no")
+async def ads_no(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("❌ отменено. можешь попробовать снова через /ads")
+
+
+# ==================== КОМАНДА /users ====================
+@router.message(Command("users"))
+async def users_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not applicants:
+        await message.answer("пока никто не заполнил анкету")
+        return
+    text = "\n".join(f"{i}.{u}" for i, u in enumerate(applicants, start=1))
+    await message.answer(text)
+
+
+# ==================== ЗАПУСК ====================
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
