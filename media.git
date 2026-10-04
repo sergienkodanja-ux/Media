@@ -12,7 +12,7 @@ from aiogram.types import (
 )
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8953808291:AAG2z4vW76sHws4mKR7LvOSqO294vDXw5iI"
+BOT_TOKEN = "8794678250:AAEKUBeGuAK0o2AqPjAq309DVQ_F0jcHhM8"
 ADMIN_IDS = [7297564960, 8996642772]   # ID админов (узнать можно у @userinfobot)
 CHANNEL_URL = "https://t.me/LexoraVisuals"
 # ===================================================
