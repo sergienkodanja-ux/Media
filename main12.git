@@ -1,0 +1,336 @@
+import telebot
+from telebot import types
+import sqlite3
+import random
+import requests
+from datetime import datetime, timedelta
+
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = '8938905705:AAHGsCOozAcp2JHwb-3WS6-ptv_EGNyZyEU'
+TGK_LINK = 'https://t.me/user_sechtgk'
+DAILY_LIMIT = 3
+ADMIN_IDS = [8996642772]  # ← ВСТАВЬ СВОЙ TELEGRAM ID (узнать: @userinfobot)
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# --- БАЗА ДАННЫХ ---
+def init_db():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            attempts_left INTEGER DEFAULT 3,
+            last_reset TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promos (
+            code TEXT PRIMARY KEY,
+            bonus_attempts INTEGER,
+            max_uses INTEGER,
+            used_count INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT attempts_left, last_reset FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def update_user(user_id, attempts_left, last_reset=None):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    if last_reset:
+        cursor.execute('UPDATE users SET attempts_left = ?, last_reset = ? WHERE user_id = ?',
+                       (attempts_left, last_reset, user_id))
+    else:
+        cursor.execute('UPDATE users SET attempts_left = ? WHERE user_id = ?',
+                       (attempts_left, user_id))
+    conn.commit()
+    conn.close()
+
+def create_user(user_id):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, attempts_left, last_reset) VALUES (?, ?, ?)',
+                   (user_id, DAILY_LIMIT, now))
+    conn.commit()
+    conn.close()
+
+def check_and_reset_attempts(user_id):
+    row = get_user(user_id)
+    if not row:
+        create_user(user_id)
+        return DAILY_LIMIT
+
+    attempts_left, last_reset_str = row
+    last_reset = datetime.fromisoformat(last_reset_str)
+
+    if datetime.now() - last_reset >= timedelta(days=1):
+        update_user(user_id, DAILY_LIMIT, datetime.now().isoformat())
+        return DAILY_LIMIT
+    return attempts_left
+
+# --- ПРОВЕРКА ДОСТУПНОСТИ ЮЗЕРНЕЙМА ---
+def is_username_available(username):
+    try:
+        r = requests.get(f'https://t.me/{username}', timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code == 200:
+            return False
+    except Exception:
+        pass
+
+    try:
+        frag = requests.get(f'https://fragment.com/username/{username}', timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if frag.status_code == 200:
+            return False
+    except Exception:
+        pass
+
+    try:
+        api_url = f'https://api.telegram.org/bot{BOT_TOKEN}/getChat'
+        resp = requests.get(api_url, params={'chat_id': f'@{username}'}, timeout=10).json()
+        if resp.get('ok'):
+            return False
+    except Exception:
+        pass
+
+    return True
+
+def generate_username():
+    consonants = 'bcdfghjklmnpqrstvwxyz'
+    vowels = 'aeiou'
+    patterns = [
+        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels) + random.choice(consonants),
+        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels) + random.choice(vowels),
+        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels),
+        lambda: random.choice(consonants) + random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels),
+        lambda: random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(consonants) + random.choice(vowels),
+    ]
+    for _ in range(20):
+        username = random.choice(patterns)()
+        if is_username_available(username):
+            return username
+    return random.choice(patterns)()
+
+# --- ПРОМОКОДЫ ---
+def get_promo(code):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT bonus_attempts, max_uses, used_count FROM promos WHERE code = ?', (code,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def use_promo(code):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('UPDATE promos SET used_count = used_count + 1 WHERE code = ?', (code,))
+    conn.commit()
+    conn.close()
+
+def create_promo(code, bonus_attempts, max_uses):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR REPLACE INTO promos (code, bonus_attempts, max_uses, used_count) VALUES (?, ?, ?, 0)',
+                   (code, bonus_attempts, max_uses))
+    conn.commit()
+    conn.close()
+
+# --- КЛАВИАТУРЫ ---
+def main_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    btn_tgk = types.InlineKeyboardButton('📢 наш тгк', url=TGK_LINK)
+    btn_search = types.InlineKeyboardButton('🔍 искать username', callback_data='search')
+    markup.add(btn_tgk, btn_search)
+    return markup
+
+def result_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    btn_again = types.InlineKeyboardButton('🔄 искать ещё', callback_data='search')
+    markup.add(btn_again)
+    return markup
+
+# --- ХЭНДЛЕРЫ ---
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    create_user(user_id)
+    check_and_reset_attempts(user_id)
+
+    text = (
+        "Привет я бот ищейка Юзов составлю красивый юзернейм "
+        "у тебя в день лимит 3 попытки поиска."
+    )
+    bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
+
+@bot.callback_query_handler(func=lambda call: call.data == 'search')
+def handle_search(call):
+    user_id = call.from_user.id
+    attempts_left = check_and_reset_attempts(user_id)
+
+    if attempts_left <= 0:
+        row = get_user(user_id)
+        last_reset = datetime.fromisoformat(row[1])
+        next_reset = last_reset + timedelta(days=1)
+        seconds_left = (next_reset - datetime.now()).total_seconds()
+        hours_left = max(1, int(seconds_left // 3600) + (1 if seconds_left % 3600 else 0))
+
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            f"🍕 попытки кончились попробуй через {hours_left} ч."
+        )
+        return
+
+    username = generate_username()
+    new_attempts = attempts_left - 1
+    update_user(user_id, new_attempts)
+
+    text = (
+        f"✈️ Вот твой username\n"
+        f"@{username}\n"
+        f"используй его если он тебе нравится\n\n"
+        f"у тебя осталось попыток {new_attempts}"
+    )
+
+    bot.send_message(call.message.chat.id, text, reply_markup=result_keyboard())
+    bot.answer_callback_query(call.id)
+
+# --- АДМИН: /give ---
+@bot.message_handler(commands=['give'])
+def give_command(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ У тебя нет прав для этой команды.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "❌ Использование: /give @username 10")
+        return
+
+    target_username = parts[1].lstrip('@')
+    try:
+        amount = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "❌ Количество попыток должно быть числом.")
+        return
+
+    try:
+        api_url = f'https://api.telegram.org/bot{BOT_TOKEN}/getChat'
+        resp = requests.get(api_url, params={'chat_id': f'@{target_username}'}, timeout=10).json()
+        if not resp.get('ok'):
+            bot.reply_to(message, f"❌ Пользователь @{target_username} не найден.")
+            return
+        target_id = resp['result']['id']
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+        return
+
+    create_user(target_id)
+    row = get_user(target_id)
+    current = row[0] if row else DAILY_LIMIT
+    update_user(target_id, current + amount)
+
+    bot.reply_to(
+        message,
+        f"✅ Пользователю @{target_username} выдано {amount} попыток.\n"
+        f"Теперь у него: {current + amount}"
+    )
+
+# --- ПОЛЬЗОВАТЕЛЬ: /promo ---
+@bot.message_handler(commands=['promo'])
+def promo_command(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        bot.reply_to(message, "❌ Использование: /promo КОД")
+        return
+
+    code = parts[1].strip().upper()
+    promo = get_promo(code)
+
+    if not promo:
+        bot.reply_to(message, "❌ Такого промокода не существует.")
+        return
+
+    bonus, max_uses, used = promo
+
+    if used >= max_uses:
+        bot.reply_to(message, "❌ Этот промокод уже полностью использован.")
+        return
+
+    user_id = message.from_user.id
+    create_user(user_id)
+    row = get_user(user_id)
+    current = row[0] if row else DAILY_LIMIT
+    update_user(user_id, current + bonus)
+    use_promo(code)
+
+    bot.reply_to(
+        message,
+        f"🎉 Промокод активирован!\n"
+        f"Ты получил +{bonus} попыток.\n"
+        f"Теперь у тебя: {current + bonus}"
+    )
+
+# --- АДМИН: /cpromo ---
+@bot.message_handler(commands=['cpromo'])
+def cpromo_command(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ У тебя нет прав для этой команды.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 4:
+        bot.reply_to(
+            message,
+            "❌ Использование: /cpromo (промокод) (кол-во использований) (попытки от 1 до 25)\n"
+            "Пример: /cpromo SUMMER 100 10"
+        )
+        return
+
+    code = parts[1].strip().upper()
+
+    try:
+        max_uses = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "❌ Количество использований должно быть числом.")
+        return
+
+    try:
+        amount = int(parts[3])
+    except ValueError:
+        bot.reply_to(message, "❌ Количество попыток должно быть числом.")
+        return
+
+    if max_uses < 1:
+        bot.reply_to(message, "❌ Количество использований должно быть больше 0.")
+        return
+
+    if amount < 1 or amount > 25:
+        bot.reply_to(message, "❌ Количество попыток должно быть от 1 до 25.")
+        return
+
+    create_promo(code, amount, max_uses)
+
+    bot.reply_to(
+        message,
+        f"✅ Промокод создан!\n\n"
+        f"📌 Код: `{code}`\n"
+        f"👥 Использований: {max_uses}\n"
+        f"🎁 Бонус: +{amount} попыток за активацию\n\n"
+        f"Пользователи активируют его командой /promo {code}"
+    )
+
+# --- ЗАПУСК ---
+if __name__ == '__main__':
+    init_db()
+    print('Бот запущен...')
+    bot.polling(none_stop=True)
