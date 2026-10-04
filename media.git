@@ -13,7 +13,12 @@ from aiogram.types import (
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = "8794678250:AAEKUBeGuAK0o2AqPjAq309DVQ_F0jcHhM8"
-ADMIN_IDS = [7297564960, 8996642772]   # ID админов (узнать можно у @userinfobot)
+
+ADMIN_IDS = [
+    7297564960,
+    8996642772,
+]
+
 CHANNEL_URL = "https://t.me/LexoraVisuals"
 # ===================================================
 
@@ -21,10 +26,10 @@ logging.basicConfig(level=logging.INFO)
 
 router = Router()
 
-# Простая память (при перезапуске сбрасывается — при желании замените на SQLite)
-users_started: set[int] = set()         # кто нажал /start
-applicants: list[str] = []              # юзернеймы тех, кто заполнил анкету
-pending_forms: dict[int, dict] = {}     # user_id -> данные анкеты
+# Память (сбрасывается при перезапуске)
+users_started: set[int] = set()
+applicants: list[str] = []
+pending_forms: dict[int, dict] = {}
 
 
 # ==================== СОСТОЯНИЯ ====================
