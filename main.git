@@ -1,271 +1,347 @@
 import asyncio
-import logging
+import re
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 )
 
-# ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8953808291:AAG2z4vW76sHws4mKR7LvOSqO294vDXw5iI"
-ADMIN_IDS = [7297564960, 8996642772]   # ID админов (узнать можно у @userinfobot)
-CHANNEL_URL = "https://t.me/LexoraVisuals"
-# ===================================================
-
-logging.basicConfig(level=logging.INFO)
+# ======================= НАСТРОЙКИ =======================
+BOT_TOKEN = "8823741141:AAHTkxlnO7EXYwzrf7BEf1zI5rVhxT5pC1U"
+ADMIN_IDS = [8471049849, 7297564960]  # ID двух администраторов
+# =========================================================
 
 router = Router()
 
-# Простая память (при перезапуске сбрасывается — при желании замените на SQLite)
-users_started: set[int] = set()         # кто нажал /start
-applicants: list[str] = []              # юзернеймы тех, кто заполнил анкету
-pending_forms: dict[int, dict] = {}     # user_id -> данные анкеты
+# Хранилища (в памяти; для прода — БД)
+cooldowns: dict[int, datetime] = {}     # user_id -> время, до которого нельзя подать заявку
+user_forms: dict[int, dict] = {}        # user_id -> анкета
 
 
-# ==================== СОСТОЯНИЯ ====================
 class Form(StatesGroup):
     name = State()
-    channel = State()
-    username = State()
+    link = State()
+    tg = State()
     views = State()
-    timezone = State()
-
-
-class Ads(StatesGroup):
-    waiting_text = State()
     confirm = State()
+    edit_choice = State()
+    edit_value = State()
 
 
-# ==================== /START ====================
-@router.message(CommandStart())
-async def start_cmd(message: Message):
-    users_started.add(message.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="стать MEDIA 🏆", callback_data="become_media")],
-        [InlineKeyboardButton(text="наш телеграм канал🍀", url=CHANNEL_URL)],
+# ---------------------- КЛАВИАТУРЫ ----------------------
+def main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Стать Media", callback_data="become_media")],
+        [InlineKeyboardButton(text="О нас", callback_data="about")],
     ])
-    await message.answer(
-        "✈️ привет я бот пиар-менеджер который помогает искать MEDIA партнёров "
-        "если хочешь стать частью нас выбери что-то из пунктов ниже!",
-        reply_markup=kb,
+
+
+def confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Да", callback_data="confirm_yes")]
+    ])
+
+
+def check_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Проверить", callback_data="check")]
+    ])
+
+
+def final_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Я все правильно заполнил", callback_data="form_ok")],
+        [InlineKeyboardButton(text="Я ошибся", callback_data="form_err")],
+    ])
+
+
+def edit_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1", callback_data="edit_1")],
+        [InlineKeyboardButton(text="2", callback_data="edit_2")],
+        [InlineKeyboardButton(text="3", callback_data="edit_3")],
+        [InlineKeyboardButton(text="4", callback_data="edit_4")],
+    ])
+
+
+def admin_kb(user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Давай", callback_data=f"adm_go:{user_id}")]
+    ])
+
+
+def admin_decision_kb(user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Принять", callback_data=f"adm_accept:{user_id}")],
+        [InlineKeyboardButton(text="Отклонить", callback_data=f"adm_reject:{user_id}")],
+        [InlineKeyboardButton(text="Рассмотрение", callback_data=f"adm_pending:{user_id}")],
+    ])
+
+
+# ---------------------- УТИЛИТЫ ----------------------
+def format_form(d: dict) -> str:
+    return (
+        "📋 <b>Анкета:</b>\n"
+        f"1. Имя: {d.get('name')}\n"
+        f"2. TikTok/YouTube: {d.get('link')}\n"
+        f"3. ТГ для связи: {d.get('tg')}\n"
+        f"4. Просмотры: {d.get('views')}"
     )
 
 
-# ==================== СТАТЬ MEDIA ====================
-@router.callback_query(F.data == "become_media")
-async def become_media(cb: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="погнали!", callback_data="go")],
-    ])
-    await cb.message.edit_text(
-        "стой стой стой! давай ты прочитаешь наши условия",
-        reply_markup=kb,
-    )
-    await cb.answer()
+def valid_link(text: str) -> bool:
+    return text.startswith("https://youtube.com/") or text.startswith("https://www.tiktok.com/")
 
 
-@router.callback_query(F.data == "go")
-async def go(cb: CallbackQuery):
-    text = (
-        "наши условия!\n"
-        "Условия работы ❄️\n"
-        "1.у вас обязательно должно быть 3 ролика в неделю не меньше\n"
-        "2.если вы решили слить важную информацию которую запрещено сливать "
-        "вы попадаете в ЧСП проекта Lexora Visuals.\n"
-        "3.у вас в чате будет ранг Тик Токер или Ютубер если вы будете привышать "
-        "свои уполномочия то получите выговор\n"
-        "(коротко говоря если вы что-то сделаете не так вам напишет наш менеджер)."
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="отлично, заполнить анкету!", callback_data="fill_form")],
-    ])
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer()
+def valid_views(text: str) -> bool:
+    return text.isdigit() and int(text) >= 350
 
 
-# ==================== АНКЕТА ====================
-@router.callback_query(F.data == "fill_form")
-async def fill_form(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Form.name)
-    await cb.message.answer("1.ваше имя :")
-    await cb.answer()
+ABOUT_TEXT = (
+    "маленький путеводитель\n\n"
+    "наш чат - https://t.me/+jLZPPE0LRbYyZTQ0\n\n"
+    "наш канал - https://t.me/lexoravisuals\n\n"
+    "скачать мод с тгк - https://t.me/lexora_up\n\n"
+    "наш сайт - http://Lexoravisuals.fun/\n\n"
+    "вопросник мода - https://t.me/+OVTkAXO_-9I4ZjUy\n\n"
+    "DevLogs канал со спойлерами - https://t.me/DEVlexoravisuals\n\n\n"
+    "спасибо за внимание с уважением Lexora Visuals!"
+)
 
 
-@router.message(Form.name)
-async def form_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await state.set_state(Form.channel)
-    await message.answer("2.ссылка на канал :")
-
-
-@router.message(Form.channel)
-async def form_channel(message: Message, state: FSMContext):
-    await state.update_data(channel=message.text)
-    await state.set_state(Form.username)
-    await message.answer("3.ваш юзернейм в Telegram (для связи):")
-
-
-@router.message(Form.username)
-async def form_username(message: Message, state: FSMContext):
-    await state.update_data(username=message.text)
-    await state.set_state(Form.views)
-    await message.answer("4.число просмотров в день (стабильно 350):")
-
-
-@router.message(Form.views)
-async def form_views(message: Message, state: FSMContext):
-    await state.update_data(views=message.text)
-    await state.set_state(Form.timezone)
-    await message.answer("5.ваш часовой пояс:")
-
-
-@router.message(Form.timezone)
-async def form_timezone(message: Message, state: FSMContext, bot: Bot):
-    await state.update_data(timezone=message.text)
-    data = await state.get_data()
-
-    user_id = message.from_user.id
-    tg_username = message.from_user.username or message.from_user.full_name
-
-    pending_forms[user_id] = data
-    applicants.append(f"@{tg_username}")
-
-    await message.answer(
-        "(если заявка будет одобрена то вам напишет менеджер).\n\n"
-        "✅ Анкета отправлена на проверку!"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="проверить", callback_data=f"check:{user_id}")],
-    ])
+async def notify_admins(bot: Bot, user_id: int, username: str | None, data: dict):
+    user_tag = f"@{username}" if username else f"id{user_id}"
+    text = f"пользователь {user_tag} подал заявку на сотрудничество проверим ее?"
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(
-                admin_id,
-                f"пользователь @{tg_username} отправил анкету проверить ее?",
-                reply_markup=kb,
-            )
-        except Exception as e:
-            logging.warning(f"Не смог отправить админу {admin_id}: {e}")
+            await bot.send_message(admin_id, text, reply_markup=admin_kb(user_id))
+        except Exception:
+            pass
 
+
+# ---------------------- ХЕНДЛЕРЫ ----------------------
+@router.message(CommandStart())
+async def start(msg: Message):
+    await msg.answer(
+        "Привет я Медиа-Менеджер, я могу тебе помочь с чем либо? "
+        "если да выбери что-то из пунктов ниже.",
+        reply_markup=main_kb()
+    )
+
+
+@router.callback_query(F.data == "about")
+async def about(cb: CallbackQuery):
+    await cb.message.answer(ABOUT_TEXT)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "become_media")
+async def become_media(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    # проверка кулдауна после отказа
+    if user_id in cooldowns:
+        remaining = cooldowns[user_id] - datetime.now()
+        if remaining.total_seconds() > 0:
+            days = remaining.days
+            hours = remaining.seconds // 3600
+            await cb.message.answer(
+                f"ваша заявка отклонена попробуйте подать через {days} д. и {hours} ч.!"
+            )
+            await cb.answer()
+            return
+        else:
+            del cooldowns[user_id]
+
+    await cb.message.answer("ты уверен в этом?", reply_markup=confirm_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "confirm_yes")
+async def confirm_yes(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer("тогда заполни анкету!\n\n1. ваше имя:")
+    await state.set_state(Form.name)
+    await cb.answer()
+
+
+# ---------------------- ЗАПОЛНЕНИЕ АНКЕТЫ ----------------------
+@router.message(StateFilter(Form.name))
+async def get_name(msg: Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip())
+    await msg.answer("2. ваш тик-ток/Ютуб (ссылка должна начинаться на https://youtube.com/ или https://www.tiktok.com/):")
+    await state.set_state(Form.link)
+
+
+@router.message(StateFilter(Form.link))
+async def get_link(msg: Message, state: FSMContext):
+    text = msg.text.strip()
+    if not valid_link(text):
+        await msg.answer("❌ ссылка должна начинаться на https://youtube.com/ или https://www.tiktok.com/. попробуйте ещё раз:")
+        return
+    await state.update_data(link=text)
+    await msg.answer("3. ваш ТГ для связи:")
+    await state.set_state(Form.tg)
+
+
+@router.message(StateFilter(Form.tg))
+async def get_tg(msg: Message, state: FSMContext):
+    await state.update_data(tg=msg.text.strip())
+    await msg.answer("4. число ваших просмотров (от 350):")
+    await state.set_state(Form.views)
+
+
+@router.message(StateFilter(Form.views))
+async def get_views(msg: Message, state: FSMContext):
+    text = msg.text.strip()
+    if not valid_views(text):
+        await msg.answer("❌ число просмотров должно быть числом и не меньше 350. попробуйте ещё раз:")
+        return
+    await state.update_data(views=text)
+    await msg.answer("проверьте все правильно?", reply_markup=check_kb())
+    await state.set_state(Form.confirm)
+
+
+@router.callback_query(F.data == "check", StateFilter(Form.confirm))
+async def check(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await cb.message.answer(format_form(data), reply_markup=final_kb())
+    await cb.answer()
+
+
+# ---------------------- ПОДТВЕРЖДЕНИЕ ----------------------
+@router.callback_query(F.data == "form_ok", StateFilter(Form.confirm))
+async def form_ok(cb: CallbackQuery, state: FSMContext):
+    user_id = cb.from_user.id
+    data = await state.get_data()
+    user_forms[user_id] = dict(data)  # сохраняем анкету
+    await cb.message.answer("отлично анкета отправлена администратору")
+    await notify_admins(cb.bot, user_id, cb.from_user.username, data)
+    await state.clear()
+    await cb.answer()
+
+
+@router.callback_query(F.data == "form_err", StateFilter(Form.confirm))
+async def form_err(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("ой ты ошибся? бывает!")
+    await cb.message.answer(
+        "какой пункт ты написал не правильно выбери от 1 до 4",
+        reply_markup=edit_kb()
+    )
+    await state.set_state(Form.edit_choice)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("edit_"), StateFilter(Form.edit_choice))
+async def edit_choice(cb: CallbackQuery, state: FSMContext):
+    num = cb.data.split("_")[1]
+    await state.update_data(edit_num=num)
+    await cb.message.answer(f"введи правильный ответ пункта {num}")
+    await state.set_state(Form.edit_value)
+    await cb.answer()
+
+
+@router.message(StateFilter(Form.edit_value))
+async def edit_value(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    num = data.get("edit_num")
+    text = msg.text.strip()
+
+    if num == "2" and not valid_link(text):
+        await msg.answer("❌ ссылка должна начинаться на https://youtube.com/ или https://www.tiktok.com/. попробуйте ещё раз:")
+        return
+    if num == "4" and not valid_views(text):
+        await msg.answer("❌ число просмотров должно быть числом и не меньше 350. попробуйте ещё раз:")
+        return
+
+    key_map = {"1": "name", "2": "link", "3": "tg", "4": "views"}
+    data[key_map[num]] = text
+    await state.update_data(**data)
+
+    user_id = msg.from_user.id
+    user_forms[user_id] = dict(data)
+
+    await msg.answer("отлично анкета отправлена администратору")
+    await notify_admins(msg.bot, user_id, msg.from_user.username, data)
     await state.clear()
 
 
-# ==================== ПРОВЕРКА АНКЕТЫ ====================
-@router.callback_query(F.data.startswith("check:"))
-async def check_form(cb: CallbackQuery):
+# ---------------------- ДЕЙСТВИЯ АДМИНА ----------------------
+@router.callback_query(F.data.startswith("adm_go:"))
+async def adm_go(cb: CallbackQuery):
     if cb.from_user.id not in ADMIN_IDS:
         await cb.answer("нет доступа", show_alert=True)
         return
-
     user_id = int(cb.data.split(":")[1])
-    data = pending_forms.get(user_id)
+    data = user_forms.get(user_id)
     if not data:
         await cb.answer("анкета не найдена", show_alert=True)
         return
-
-    form_text = (
-        "анкета пользователя:\n"
-        f"1.имя: {data['name']}\n"
-        f"2.ссылка на канал: {data['channel']}\n"
-        f"3.юзернейм в Telegram: {data['username']}\n"
-        f"4.просмотров в день: {data['views']}\n"
-        f"5.часовой пояс: {data['timezone']}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="отклонить", callback_data=f"reject:{user_id}")],
-    ])
-    await cb.message.answer(form_text, reply_markup=kb)
+    await cb.message.answer(format_form(data), reply_markup=admin_decision_kb(user_id))
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("reject:"))
-async def reject_form(cb: CallbackQuery, bot: Bot):
+@router.callback_query(F.data.startswith("adm_accept:"))
+async def adm_accept(cb: CallbackQuery):
     if cb.from_user.id not in ADMIN_IDS:
         await cb.answer("нет доступа", show_alert=True)
         return
-
     user_id = int(cb.data.split(":")[1])
     try:
-        await bot.send_message(
+        await cb.bot.send_message(
             user_id,
-            "ваша анкета отклонена извините попробуйте в следующий раз!",
+            "вы приняты на сотрудничество скоро вам напишет менеджер"
         )
-        await cb.message.edit_reply_markup(reply_markup=None)
-        await cb.answer("пользователь уведомлён")
     except Exception:
-        await cb.answer("не смог отправить пользователю", show_alert=True)
+        pass
+    await cb.message.answer("✅ Принято.")
+    user_forms.pop(user_id, None)
+    await cb.answer()
 
 
-# ==================== КОМАНДА /ads ====================
-@router.message(Command("ads"))
-async def ads_cmd(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
+@router.callback_query(F.data.startswith("adm_reject:"))
+async def adm_reject(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("нет доступа", show_alert=True)
         return
-    await state.set_state(Ads.waiting_text)
-    await message.answer(
-        "напиши объявление и оно отправится всем пользователям бота которые нажали /start"
-    )
+    user_id = int(cb.data.split(":")[1])
+    cooldowns[user_id] = datetime.now() + timedelta(days=3)  # блок на 3 дня
+    try:
+        await cb.bot.send_message(
+            user_id,
+            "ваша заявка отклонена администратором попробуйте подать через 3 дня"
+        )
+    except Exception:
+        pass
+    await cb.message.answer("❌ Отклонено.")
+    user_forms.pop(user_id, None)
+    await cb.answer()
 
 
-@router.message(Ads.waiting_text)
-async def ads_get_text(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
+@router.callback_query(F.data.startswith("adm_pending:"))
+async def adm_pending(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("нет доступа", show_alert=True)
         return
-    await state.update_data(ads_text=message.text)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="да", callback_data="ads_yes")],
-        [InlineKeyboardButton(text="отменить", callback_data="ads_no")],
-    ])
-    await message.answer(
-        f"ты хочешь объявить объявление {message.text} верно?",
-        reply_markup=kb,
-    )
-    await state.set_state(Ads.confirm)
+    user_id = int(cb.data.split(":")[1])
+    try:
+        await cb.bot.send_message(
+            user_id,
+            "ваша анкета на рассмотрении менеджер напишет вам если вас примут"
+        )
+    except Exception:
+        pass
+    await cb.message.answer("⏳ Отмечено как «рассмотрение».")
+    await cb.answer()
 
 
-@router.callback_query(Ads.confirm, F.data == "ads_yes")
-async def ads_yes(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    text = data.get("ads_text", "")
-    sent = 0
-    for uid in list(users_started):
-        try:
-            await bot.send_message(uid, text)
-            sent += 1
-        except Exception:
-            pass
-    await cb.message.edit_text(f"✅ объявление отправлено {sent} пользователям")
-    await state.clear()
-
-
-@router.callback_query(Ads.confirm, F.data == "ads_no")
-async def ads_no(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("❌ отменено. можешь попробовать снова через /ads")
-
-
-# ==================== КОМАНДА /users ====================
-@router.message(Command("users"))
-async def users_cmd(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    if not applicants:
-        await message.answer("пока никто не заполнил анкету")
-        return
-    text = "\n".join(f"{i}.{u}" for i, u in enumerate(applicants, start=1))
-    await message.answer(text)
-
-
-# ==================== ЗАПУСК ====================
+# ---------------------- ЗАПУСК ----------------------
 async def main():
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен...")
     await dp.start_polling(bot)
